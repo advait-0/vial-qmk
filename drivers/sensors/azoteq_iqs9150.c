@@ -80,507 +80,240 @@
 #define IQS9150_MAX_LEN                     256
 #define IQS9150_MAX_CONTACTS                7
 
+#define IQS915X_ADDR        (0x56 << 1)       // 7-bit I2C address
+#define IQS915X_PROD_REG    0x1000
+#define I2C_TIMEOUT_MS     200
+
 // define register map
 
 // Driver interface structure
 const pointing_device_driver_t azoteq_iqs9150_pointing_device_driver = {
     .init       = azoteq_iqs9150_init,
     .get_report = azoteq_iqs9150_get_report,
-    .set_cpi    = azoteq_iqs9150_set_cpi,
-    .get_cpi    = azoteq_iqs9150_get_cpi,
+    // .set_cpi    = azoteq_iqs9150_set_cpi,
+    // .get_cpi    = azoteq_iqs9150_get_cpi,
 };
 
 // Global variables
-static uint16_t azoteq_iqs9150_product_number = AZOTEQ_IQS9150_UNKNOWN;
-static azoteq_iqs9150_comms_mode_t azoteq_iqs9150_comms_mode = AZOTEQ_IQS9150_COMMS_MODE_WAIT;
+// static uint16_t azoteq_iqs9150_product_number = AZOTEQ_IQS9150_UNKNOWN;
+// static azoteq_iqs9150_comms_mode_t azoteq_iqs9150_comms_mode = AZOTEQ_IQS9150_COMMS_MODE_WAIT;
 // static azoteq_iqs9150_ver_info_t azoteq_iqs9150_ver_info = {0};
 
-static struct {
-    uint16_t resolution_x;
-    uint16_t resolution_y;
-} azoteq_iqs9150_device_resolution_t;
+static inline void bb_delay(void) {
+    wait_us(5); // ~100kHz
+}
+
+static inline void bb_scl_high(void) {
+    setPinInputHigh(I2C1_SCL_PIN);
+    bb_delay();
+}
+
+static inline void bb_scl_low(void) {
+    setPinOutput(I2C1_SCL_PIN);
+    writePinLow(I2C1_SCL_PIN);
+    bb_delay();
+}
+
+static inline void bb_sda_high(void) {
+    setPinInputHigh(I2C1_SDA_PIN);
+    bb_delay();
+}
+
+static inline void bb_sda_low(void) {
+    setPinOutput(I2C1_SDA_PIN);
+    writePinLow(I2C1_SDA_PIN);
+    bb_delay();
+}
+
+/* ---- Public transport API ---- */
+
+void iqs9150_i2c_init(void) {
+    bb_sda_high();
+    bb_scl_high();
+}
+
+void iqs9150_i2c_start(void) {
+    bb_sda_high();
+    bb_scl_high();
+    bb_sda_low();
+    bb_scl_low();
+}
+
+void iqs9150_i2c_stop(void) {
+    bb_sda_low();
+    bb_scl_high();
+    bb_sda_high();
+}
+
+bool iqs9150_i2c_write_u8(uint8_t byte) {
+    for (int i = 7; i >= 0; i--) {
+        (byte & (1 << i)) ? bb_sda_high() : bb_sda_low();
+        bb_scl_high();
+        bb_scl_low();
+    }
+
+    /* ACK */
+    bb_sda_high();
+    bb_scl_high();
+    bool ack = !readPin(I2C1_SDA_PIN);
+    bb_scl_low();
+
+    return ack;
+}
+
+uint8_t iqs9150_i2c_read_u8(bool ack) {
+    uint8_t v = 0;
+
+    bb_sda_high();
+    for (int i = 7; i >= 0; i--) {
+        bb_scl_high();
+        if (readPin(I2C1_SDA_PIN)) {
+            v |= (1 << i);
+        }
+        bb_scl_low();
+    }
+
+    ack ? bb_sda_low() : bb_sda_high();
+    bb_scl_high();
+    bb_scl_low();
+    bb_sda_high();
+
+    return v;
+}
+
+static bool iqs9150_i2c_write_reg16_addr(uint16_t reg) {
+    return iqs9150_i2c_write_u8(0xAC) &&           // address + write
+           iqs9150_i2c_write_u8(reg & 0xFF) &&     // LSB first
+           iqs9150_i2c_write_u8(reg >> 8);         // MSB
+}
+
+bool iqs9150_i2c_write_reg16(uint16_t reg, uint16_t value) {
+    iqs9150_i2c_start();
+
+    if (!iqs9150_i2c_write_reg16_addr(reg))
+        goto fail;
+
+    if (!iqs9150_i2c_write_u8(value & 0xFF))   // DATA LSB
+        goto fail;
+
+    if (!iqs9150_i2c_write_u8(value >> 8))     // DATA MSB
+        goto fail;
+
+    iqs9150_i2c_stop();
+    return true;
+
+fail:
+    iqs9150_i2c_stop();
+    return false;
+}
+
+bool iqs9150_i2c_read_reg16(uint16_t reg, uint16_t *value) {
+    uint8_t lsb, msb;
+
+    iqs9150_i2c_start();
+    if (!iqs9150_i2c_write_reg16_addr(reg)) goto fail;
+
+    iqs9150_i2c_start();
+    if (!iqs9150_i2c_write_u8(0xAD)) goto fail;
+
+    lsb = iqs9150_i2c_read_u8(true);
+    msb = iqs9150_i2c_read_u8(false);
+
+    *value = (msb << 8) | lsb;
+    iqs9150_i2c_stop();
+    return true;
+
+fail:
+    iqs9150_i2c_stop();
+    return false;
+}
+
+static void wait_for_rdy_low(void) {
+    while (readPin(IQS9150_RDY_PIN)) {
+        wait_ms(1);
+    }
+}
 
 static i2c_status_t azoteq_iqs9150_init_status = 1;
 
-// Communication helper functions
-i2c_status_t azoteq_iqs9150_end_session(void) {
-    const uint8_t END_BYTE = 1; // any data
-    return i2c_write_register16(AZOTEQ_IQS9150_ADDRESS, IQS9150_END_COMMS, &END_BYTE, 1, AZOTEQ_IQS9150_TIMEOUT_MS);
-}
-
-i2c_status_t azoteq_iqs9150_wake(void) {
-    uprintf("Pinging:%02X\n", AZOTEQ_IQS9150_ADDRESS);
-    return i2c_ping_address(AZOTEQ_IQS9150_ADDRESS, 1);
-}
-
-static i2c_status_t azoteq_iqs9150_force_comms(void) {
-    uint8_t msg_buf[] = { 0xFF, };
-
-    switch (azoteq_iqs9150_comms_mode) {
-        case AZOTEQ_IQS9150_COMMS_MODE_WAIT:
-            // For simplicity in QMK, we'll just wait a bit
-            wait_us(100);
-            return I2C_STATUS_SUCCESS;
-
-        case AZOTEQ_IQS9150_COMMS_MODE_FREE:
-            return I2C_STATUS_SUCCESS;
-
-        case AZOTEQ_IQS9150_COMMS_MODE_FORCE:
-            // Send force communication command
-            /* Ensure we pass a pointer of type 'const uint8_t *' to match
-             * the i2c_transmit prototype. Passing '&msg_buf' would produce
-             * a 'uint8_t (*)[1]' type which is incompatible. */
-            return i2c_transmit(AZOTEQ_IQS9150_ADDRESS, (const uint8_t *)msg_buf,
-                                sizeof(msg_buf), AZOTEQ_IQS9150_TIMEOUT_MS);
-
-        default:
-            return I2C_STATUS_ERROR;
-    }
-}
-
-static i2c_status_t azoteq_iqs9150_read_burst(uint16_t reg, void *val, uint16_t val_len) {
-    i2c_status_t status;
-    uint16_t rem_len = val_len;
-    uint8_t *val_ptr = (uint8_t *)val;
-
-    while (rem_len) {
-        uint16_t burst_len = MIN(rem_len, IQS9150_MAX_LEN);
-        uint16_t reg_offs = val_len - rem_len;
-
-        status = azoteq_iqs9150_force_comms();
-        if (status != I2C_STATUS_SUCCESS) {
-            return status;
-        }
-
-        status = i2c_read_register16(AZOTEQ_IQS9150_ADDRESS, reg + reg_offs,
-                                   val_ptr + reg_offs, burst_len, AZOTEQ_IQS9150_TIMEOUT_MS);
-        if (status != I2C_STATUS_SUCCESS) {
-            return status;
-        }
-
-        // Check for communication error - use direct casting like 5XX driver
-        if (burst_len >= 2) {
-            uint16_t *error_check_ptr = (uint16_t *)(val_ptr + reg_offs);
-            if (*error_check_ptr == IQS9150_COMMS_ERROR) {
-                return I2C_STATUS_ERROR;
-            }
-        }
-
-        rem_len -= burst_len;
-    }
-
-    return I2C_STATUS_SUCCESS;
-}
-
-static i2c_status_t azoteq_iqs9150_read_word(uint16_t reg, uint16_t *val) {
-    uint16_t val_buf;
-    i2c_status_t status = azoteq_iqs9150_read_burst(reg, &val_buf, sizeof(val_buf));
-    if (status == I2C_STATUS_SUCCESS) {
-        // Use SWAP_H_L_BYTES like the 5XX driver for endianness handling
-        *val = AZOTEQ_IQS9150_SWAP_H_L_BYTES(val_buf);
-    }
-    return status;
-}
-
-static i2c_status_t azoteq_iqs9150_write_burst(uint16_t reg, const void *val, uint16_t val_len) {
-    i2c_status_t status;
-    uint16_t rem_len = val_len;
-    const uint8_t *val_ptr = (const uint8_t *)val;
-
-    while (rem_len) {
-        uint16_t burst_len = MIN(rem_len, IQS9150_MAX_LEN);
-        uint16_t reg_offs = val_len - rem_len;
-
-        status = azoteq_iqs9150_force_comms();
-        if (status != I2C_STATUS_SUCCESS) {
-            return status;
-        }
-
-        status = i2c_write_register16(AZOTEQ_IQS9150_ADDRESS, reg + reg_offs,
-                                    val_ptr + reg_offs, burst_len, AZOTEQ_IQS9150_TIMEOUT_MS);
-        if (status != I2C_STATUS_SUCCESS) {
-            return status;
-        }
-
-        rem_len -= burst_len;
-    }
-
-    return I2C_STATUS_SUCCESS;
-}
-
-static i2c_status_t azoteq_iqs9150_write_word(uint16_t reg, uint16_t val) {
-    uint16_t val_buf = AZOTEQ_IQS9150_SWAP_H_L_BYTES(val);
-    return azoteq_iqs9150_write_burst(reg, &val_buf, sizeof(val_buf));
-}
-
-// Configuration functions
-i2c_status_t azoteq_iqs9150_reset_suspend(bool reset, bool suspend, bool end_session) {
-    uint16_t control = 0;
-    i2c_status_t status;
-
-    uprintf("IQS9150: Reset/suspend - reset:%d, suspend:%d\n", reset, suspend);
-
-    status = azoteq_iqs9150_read_word(IQS9150_CONTROL, &control);
-    if (status == I2C_STATUS_SUCCESS) {
-        uprintf("IQS9150: Read control register: 0x%04X\n", control);
-        if (reset) {
-            // control |= IQS9150_CONTROL_ACK_RESET;
-            control = IQS9150_CONTROL_ACK_RESET;
-        }
-        if (suspend) {
-            control |= IQS9150_CONTROL_SUSPEND;
-        } else {
-            control &= ~IQS9150_CONTROL_SUSPEND;
-        }
-
-        // status = azoteq_iqs9150_write_word(IQS9150_CONTROL, IQS9150_CONTROL_ACK_RESET);
-
-        const uint8_t test = 0x80;
-
-        status = i2c_write_register16(AZOTEQ_IQS9150_ADDRESS, IQS9150_CONTROL,
-                                    &test, 16, AZOTEQ_IQS9150_TIMEOUT_MS);
-        if (status == I2C_STATUS_SUCCESS) {
-            uprintf("IQS9150: Wrote control register: 0x%04X\n", control);
-        } else {
-            uprintf("IQS9150: Failed to write control register, status: %d\n", status);
-        }
-    } else {
-        uprintf("IQS9150: Failed to read control register, status: %d\n", status);
-    }
-
-    if (end_session) {
-        azoteq_iqs9150_end_session();
-    }
-
-    return status;
-}
-
-i2c_status_t azoteq_iqs9150_set_report_rate(uint16_t report_rate_ms, azoteq_iqs9150_charging_modes_t mode, bool end_session) {
-    uprintf("IQS9150: Set report rate %dms, mode: %d\n", report_rate_ms, mode);
-    if (end_session) {
-        azoteq_iqs9150_end_session();
-    }
-    return I2C_STATUS_SUCCESS;
-}
-
-i2c_status_t azoteq_iqs9150_set_event_mode(bool enabled, bool end_session) {
-    uint16_t config = 0;
-    i2c_status_t status;
-
-    uprintf("IQS9150: Set event mode: %d\n", enabled);
-
-    status = azoteq_iqs9150_read_word(IQS9150_CONFIG, &config);
-    if (status == I2C_STATUS_SUCCESS) {
-        uprintf("IQS9150: Read config register: 0x%04X\n", config);
-        if (enabled) {
-            config |= IQS9150_CONFIG_EVENT_MODE;
-        } else {
-            config &= ~IQS9150_CONFIG_EVENT_MODE;
-        }
-
-        status = azoteq_iqs9150_write_word(IQS9150_CONFIG, config);
-        if (status == I2C_STATUS_SUCCESS) {
-            uprintf("IQS9150: Wrote config register: 0x%04X\n", config);
-        } else {
-            uprintf("IQS9150: Failed to write config register, status: %d\n", status);
-        }
-    } else {
-        uprintf("IQS9150: Failed to read config register, status: %d\n", status);
-    }
-
-    if (end_session) {
-        azoteq_iqs9150_end_session();
-    }
-
-    return status;
-}
-
-i2c_status_t azoteq_iqs9150_set_xy_config(bool flip_x, bool flip_y, bool switch_xy, bool end_session) {
-    uprintf("IQS9150: Set XY config - flip_x:%d, flip_y:%d, switch_xy:%d\n", flip_x, flip_y, switch_xy);
-    // This would need to be implemented based on specific register map
-    // For now, return success as a placeholder
-    if (end_session) {
-        azoteq_iqs9150_end_session();
-    }
-    return I2C_STATUS_SUCCESS;
-}
-
-// CPI and resolution functions
-void azoteq_iqs9150_set_cpi(uint16_t cpi) {
-    if (azoteq_iqs9150_product_number != AZOTEQ_IQS9150_UNKNOWN) {
-        azoteq_iqs9150_resolution_t resolution = {0};
-        resolution.x_resolution = AZOTEQ_IQS9150_SWAP_H_L_BYTES(MIN(azoteq_iqs9150_device_resolution_t.resolution_x,
-                                                                   AZOTEQ_IQS9150_INCH_TO_RESOLUTION_X(cpi)));
-        resolution.y_resolution = AZOTEQ_IQS9150_SWAP_H_L_BYTES(MIN(azoteq_iqs9150_device_resolution_t.resolution_y,
-                                                                   AZOTEQ_IQS9150_INCH_TO_RESOLUTION_Y(cpi)));
-        azoteq_iqs9150_write_burst(IQS9150_X_RES, &resolution, sizeof(azoteq_iqs9150_resolution_t));
-    }
-}
-
-uint16_t azoteq_iqs9150_get_cpi(void) {
-    if (azoteq_iqs9150_product_number != AZOTEQ_IQS9150_UNKNOWN) {
-        azoteq_iqs9150_resolution_t resolution = {0};
-        i2c_status_t status = azoteq_iqs9150_read_burst(IQS9150_X_RES, &resolution, sizeof(azoteq_iqs9150_resolution_t));
-        if (status == I2C_STATUS_SUCCESS) {
-            return AZOTEQ_IQS9150_RESOLUTION_X_TO_INCH(AZOTEQ_IQS9150_SWAP_H_L_BYTES(resolution.x_resolution));
-        }
-    }
-    return 0;
-}
-
-uint16_t azoteq_iqs9150_get_product(void) {
-    // uprintf("Pin:%ld\n", readPin(A9));
-    i2c_status_t status = azoteq_iqs9150_read_word(IQS9150_PROD_NUM, &azoteq_iqs9150_product_number);
-    wait_ms(10);
-    azoteq_iqs9150_end_session();
-    
-    if (status != I2C_STATUS_SUCCESS) {
-        azoteq_iqs9150_product_number = AZOTEQ_IQS9150_UNKNOWN;
-        uprintf("Read unsuccessful\n");
-    }
-    uprintf("IQS9150: Product number 0x%04X\n", azoteq_iqs9150_product_number);
-    return azoteq_iqs9150_product_number;
-}
-
-static void azoteq_iqs9150_setup_resolution(void) {
-    uprintf("IQS9150: Setting up resolution for product 0x%04X\n", azoteq_iqs9150_product_number);
-
-    // Set default resolution based on product
-    switch (azoteq_iqs9150_product_number) {
-        case AZOTEQ_IQS9150:
-            azoteq_iqs9150_device_resolution_t.resolution_x = AZOTEQ_IQS9150_RESOLUTION_X;
-            azoteq_iqs9150_device_resolution_t.resolution_y = AZOTEQ_IQS9150_RESOLUTION_Y;
-            break;
-        case AZOTEQ_IQS9151:
-            azoteq_iqs9150_device_resolution_t.resolution_x = AZOTEQ_IQS9150_RESOLUTION_X;
-            azoteq_iqs9150_device_resolution_t.resolution_y = AZOTEQ_IQS9150_RESOLUTION_Y;
-            break;
-        default:
-            azoteq_iqs9150_device_resolution_t.resolution_x = AZOTEQ_IQS9150_RESOLUTION_X;
-            azoteq_iqs9150_device_resolution_t.resolution_y = AZOTEQ_IQS9150_RESOLUTION_Y;
-            break;
-    }
-
-    uprintf("IQS9150: Resolution set to %dx%d\n",
-               azoteq_iqs9150_device_resolution_t.resolution_x,
-               azoteq_iqs9150_device_resolution_t.resolution_y);
-}
-
-// Data reading functions
-i2c_status_t azoteq_iqs9150_get_base_data(azoteq_iqs9150_base_data_t *base_data) {
-    azoteq_iqs9150_status_t status_report = {0};
-    i2c_status_t status;
-
-    status = azoteq_iqs9150_read_burst(IQS9150_STATUS, &status_report, sizeof(status_report));
-    if (status == I2C_STATUS_SUCCESS) {
-        // Extract basic data from full status report
-        base_data->num_contacts = status_report.num_contacts;
-        base_data->gestures = status_report.gesture_events;
-        base_data->info = status_report.system_info;
-
-        // Get touch coordinates from first contact
-        if (status_report.num_contacts > 0) {
-            base_data->x = (int16_t)AZOTEQ_IQS9150_SWAP_H_L_BYTES(status_report.touch_data[0].abs_x);
-            base_data->y = (int16_t)AZOTEQ_IQS9150_SWAP_H_L_BYTES(status_report.touch_data[0].abs_y);
-        } else {
-            base_data->x = 0;
-            base_data->y = 0;
-        }
-
-        azoteq_iqs9150_end_session();
-    }
-
-    return status;
-}
-
-// Load complete device configuration from IQS9150_init.h
-
-
-static void azoteq_iqs9150_scan_bus(void) {
-    uprintf("IQS9150: I2C scan start\n");
-    for (uint8_t addr7 = 0x03; addr7 <= 0x77; addr7++) {
-        i2c_status_t s = i2c_ping_address((uint8_t)(addr7 << 1), 1); // QMK uses 8-bit (7-bit << 1)
-        if (s == I2C_STATUS_SUCCESS) {
-            uprintf("IQS9150: Found device at 0x%02X (8-bit 0x%02X)\n", addr7, (addr7 << 1));
-        }
-        wait_ms(2);
-    }
-    uprintf("IQS9150: I2C scan done\n");
-}
-
-// static void tester(void) {
-//     uint8_t data[2];
-//     i2c_status_t status = i2c_read_register16(0x56, 0x1000, (uint8_t *)data, 2, 10);
-//     azoteq_iqs9150_end_session();
-//     if (status != I2C_STATUS_SUCCESS) {
-//         uprintf("niggesh\n");
-//     }
-//     else {
-//         uprintf("read success: %d\n", 11);
-//     }
-// }
-
-static void tester(void) {
-    // Wait for RDY low (A9) before starting I2C, per datasheet
-    const uint16_t rdy_timeout_ms = 1000;
-    uint16_t waited = 0;
-    while (readPin(A9)) {
-        if (waited++ >= rdy_timeout_ms) {
-            uprintf("IQS9150: RDY high for %dms, proceeding anyway\n", rdy_timeout_ms);
-            break;
-        }
-        wait_ms(1);
-    }
-
-    // Read the 16-bit Product Number register (0x1000)
-    uint8_t buf[2] = {0};
-    i2c_status_t status = i2c_read_register16(AZOTEQ_IQS9150_ADDRESS, IQS9150_PROD_NUM, buf, sizeof(buf), 100);
-
-    // azoteq_iqs9150_end_session();
-
-    if (status == I2C_STATUS_SUCCESS) {
-        uint16_t product = ((uint16_t)buf[0] << 8) | buf[1]; // MSB first
-        uprintf("IQS9150: Product number read OK: 0x%04X\n", product);
-        azoteq_iqs9150_end_session();
-    } else {
-        uprintf("IQS9150: Product number read failed, i2c status: %d (addr 0x%02X)\n",
-                status, AZOTEQ_IQS9150_ADDRESS);
-    }
-}
-
-// Main driver functions
 void azoteq_iqs9150_init(void) {
-    wait_ms(3000);
-    azoteq_iqs9150_reset_suspend(true, false, true);
-    uprintf("IQS9150: Starting init\n");
-    i2c_init();
-    azoteq_iqs9150_wake();
-    azoteq_iqs9150_get_product();
-    // azoteq_iqs9150_init_status = azoteq_iqs9150_load_settings();
-    azoteq_iqs9150_scan_bus();
-    
-    tester();
-    
+    uint16_t product;
+    uint16_t config;
 
-    // wait_ms(3000);    
-    if (azoteq_iqs9150_get_product() != AZOTEQ_IQS9150_UNKNOWN) {
-        uprintf("IQS9150: Device detected, product: 0x%04X\n", azoteq_iqs9150_product_number);
-        
-        // Load complete device configuration from IQS9150_init.h if available
-        
-        if (azoteq_iqs9150_init_status != I2C_STATUS_SUCCESS) {
-            uprintf("IQS9150: Settings load failed, applying minimal config\n");
-        }
-        
-        azoteq_iqs9150_setup_resolution();
+    azoteq_iqs9150_init_status = I2C_STATUS_ERROR;
 
-        // Set communication mode based on device capabilities
-        azoteq_iqs9150_comms_mode = AZOTEQ_IQS9150_COMMS_MODE_FREE;
-        uprintf("IQS9150: Set communication mode to FREE\n");
+    uprintf("\n=== IQS9150 INIT BEGIN ===\n");
 
-        // Configure basic settings (if not loaded from init file)
-        azoteq_iqs9150_init_status |= azoteq_iqs9150_set_report_rate(AZOTEQ_IQS9150_REPORT_RATE, AZOTEQ_IQS9150_ACTIVE, false);
-        azoteq_iqs9150_init_status |= azoteq_iqs9150_set_event_mode(false, false); // Use streaming mode for QMK
+    /* STEP 0: I2C lines idle */
+    iqs9150_i2c_init();
 
-#if defined(AZOTEQ_IQS9150_ROTATION_90)
-        azoteq_iqs9150_init_status |= azoteq_iqs9150_set_xy_config(false, true, true, false);
-        uprintf("IQS9150: Applied 90 degree rotation\n");
-#elif defined(AZOTEQ_IQS9150_ROTATION_180)
-        azoteq_iqs9150_init_status |= azoteq_iqs9150_set_xy_config(true, true, false, false);
-        uprintf("IQS9150: Applied 180 degree rotation\n");
-#elif defined(AZOTEQ_IQS9150_ROTATION_270)
-        azoteq_iqs9150_init_status |= azoteq_iqs9150_set_xy_config(true, false, true, false);
-        uprintf("IQS9150: Applied 270 degree rotation\n");
-#else
-        azoteq_iqs9150_init_status |= azoteq_iqs9150_set_xy_config(false, false, false, false);
-        uprintf("IQS9150: No rotation applied\n");
-#endif
+    /* STEP 1: Wait for comms window */
+    wait_for_rdy_low();
 
-        azoteq_iqs9150_end_session();
-        wait_ms(AZOTEQ_IQS9150_REPORT_RATE + 1);
-
-        if (azoteq_iqs9150_init_status == I2C_STATUS_SUCCESS) {
-            uprintf("IQS9150: Init completed successfully\n");
-        } else {
-            uprintf("IQS9150: Init completed with errors, status: %d\n", azoteq_iqs9150_init_status);
-        }
-    } else {
-        uprintf("IQS9150: Device not detected or unknown product\n");
+    /* STEP 2: Read product ID */
+    if (!iqs9150_i2c_read_reg16(0x1000, &product)) {
+        uprintf("IQS9150: product read failed\n");
+        return;
     }
+
+    uprintf("IQS9150: product = 0x%04X\n", product);
+
+    if (product != 0x076A && product != 0x09BC) {
+        uprintf("IQS9150: unknown product\n");
+        return;
+    }
+
+    /* STEP 3: Clear SHOW_RESET (mandatory) */
+    wait_for_rdy_low();
+
+    /* CONTROL = ACK_RESET (0x80) */
+    if (!iqs9150_i2c_write_reg16(0x11BC, 0x0080)) {
+        uprintf("IQS9150: failed to clear SHOW_RESET\n");
+        return;
+    }
+
+    /* STEP 4: Enable forced comms + streaming mode */
+    wait_for_rdy_low();
+
+    if (!iqs9150_i2c_read_reg16(0x11BE, &config)) {
+        uprintf("IQS9150: failed to read CONFIG\n");
+        return;
+    }
+
+    config |= (1 << 4);   /* FORCED_COMMS */
+    config &= ~(1 << 8);  /* EVENT_MODE = streaming */
+
+    if (!iqs9150_i2c_write_reg16(0x11BE, config)) {
+        uprintf("IQS9150: failed to write CONFIG\n");
+        return;
+    }
+
+    /* STEP 5: Disable low power modes */
+    wait_for_rdy_low();
+
+    if (!iqs9150_i2c_write_reg16(0x11B8, 0x00FF)) {
+        uprintf("IQS9150: failed to set TIMEOUT_COMMS\n");
+        return;
+    }
+
+    /* STEP 6: Set resolution */
+    wait_for_rdy_low();
+
+    iqs9150_i2c_write_reg16(0x11E6, 2048); // X_RES
+    iqs9150_i2c_write_reg16(0x11E8, 2048); // Y_RES
+
+    /* STEP 7: End session */
+    wait_for_rdy_low();
+
+    iqs9150_i2c_write_reg16(0xEEEE, 0x0000);
+
+    azoteq_iqs9150_init_status = I2C_STATUS_SUCCESS;
+    uprintf("=== IQS9150 INIT OK ===\n");
 }
+
 
 report_mouse_t azoteq_iqs9150_get_report(report_mouse_t mouse_report) {
     report_mouse_t temp_report = {0};
-    // uprintf("HI\n");
-    
-
-    if (azoteq_iqs9150_init_status == I2C_STATUS_SUCCESS) {
-        // uprintf("nigger\n");
-        azoteq_iqs9150_base_data_t base_data = {0};
-        i2c_status_t status = azoteq_iqs9150_get_base_data(&base_data);
-        bool ignore_movement = false;
-
-        if (status == I2C_STATUS_SUCCESS) {
-            // Handle reset condition
-
-            if (base_data.info.show_reset) {
-                uprintf("IQS9150 - Device reset detected\n");
-                azoteq_iqs9150_init(); // Reinitialize
-                return temp_report;
-            }
-
-            // Handle gestures
-            if (base_data.gestures.tap) {
-                uprintf("IQS9150 - Single tap\n");
-                temp_report.buttons = pointing_device_handle_buttons(temp_report.buttons, true, POINTING_DEVICE_BUTTON1);
-            } else if (base_data.gestures.hold) {
-                uprintf("IQS9150 - Hold gesture\n");
-                temp_report.buttons = pointing_device_handle_buttons(temp_report.buttons, true, POINTING_DEVICE_BUTTON1);
-            } else if (base_data.gestures.two_finger_tap) {
-                uprintf("IQS9150 - Two finger tap\n");
-                temp_report.buttons = pointing_device_handle_buttons(temp_report.buttons, true, POINTING_DEVICE_BUTTON2);
-            } else if (base_data.gestures.swipe_x_neg) {
-                uprintf("IQS9150 - Swipe X-\n");
-                temp_report.buttons = pointing_device_handle_buttons(temp_report.buttons, true, POINTING_DEVICE_BUTTON4);
-                ignore_movement = true;
-            } else if (base_data.gestures.swipe_x_pos) {
-                uprintf("IQS9150 - Swipe X+\n");
-                temp_report.buttons = pointing_device_handle_buttons(temp_report.buttons, true, POINTING_DEVICE_BUTTON5);
-                ignore_movement = true;
-            } else if (base_data.gestures.swipe_y_neg) {
-                uprintf("IQS9150 - Swipe Y-\n");
-                temp_report.buttons = pointing_device_handle_buttons(temp_report.buttons, true, POINTING_DEVICE_BUTTON6);
-                ignore_movement = true;
-            } else if (base_data.gestures.swipe_y_pos) {
-                uprintf("IQS9150 - Swipe Y+\n");
-                temp_report.buttons = pointing_device_handle_buttons(temp_report.buttons, true, POINTING_DEVICE_BUTTON3);
-                ignore_movement = true;
-            } else if (base_data.gestures.scroll) {
-                uprintf("IQS9150 - Scroll\n");
-                // For scroll, use the gesture coordinates
-                temp_report.h = CONSTRAIN_HID(base_data.x / 100); // Scale down
-                temp_report.v = CONSTRAIN_HID(base_data.y / 100); // Scale down
-            } else if (base_data.gestures.zoom) {
-                uprintf("IQS9150 - Zoom\n");
-                if (base_data.x < 0) {
-                    temp_report.buttons = pointing_device_handle_buttons(temp_report.buttons, true, POINTING_DEVICE_BUTTON7);
-                } else if (base_data.x > 0) {
-                    temp_report.buttons = pointing_device_handle_buttons(temp_report.buttons, true, POINTING_DEVICE_BUTTON8);
-                }
-            }
-
-            // Handle trackpad movement
-            if (base_data.num_contacts == 1 && !ignore_movement) {
-                temp_report.x = CONSTRAIN_HID_XY(base_data.x);
-                temp_report.y = CONSTRAIN_HID_XY(base_data.y);
-            }
-
-        } else {
-            uprintf("IQS9150 - Get report failed, i2c status: %d\n", status);
-        }
-    } else {
-        uprintf("IQS9150 - Init failed, i2c status: %d\n", azoteq_iqs9150_init_status);
-    }
-
+    // azoteq_iqs9150_init();
     return temp_report;
 }

@@ -8,7 +8,23 @@
 #include "i2c_master.h"
 #include "pointing_device.h"
 #include "util.h"
-// #include "IQS9150_init.h"
+#include <stdbool.h>
+#include <stdint.h>
+
+/* Low-level transport API used by the IQS9150 driver only */
+
+void iqs9150_i2c_init(void);
+
+void iqs9150_i2c_start(void);
+void iqs9150_i2c_stop(void);
+
+bool iqs9150_i2c_write_u8(uint8_t byte);
+uint8_t iqs9150_i2c_read_u8(bool ack);
+
+/* Helpers */
+bool iqs9150_i2c_write_reg16(uint16_t reg, uint16_t value);
+bool iqs9150_i2c_read_reg16(uint16_t reg, uint16_t *value);
+bool iqs9150_i2c_write_reg16_val(uint16_t reg, uint16_t value);
 
 
 // Product numbers
