@@ -236,84 +236,160 @@ static void wait_for_rdy_low(void) {
 
 static i2c_status_t azoteq_iqs9150_init_status = 1;
 
+static bool iqs9150_read_rel_xy(int16_t *x, int16_t *y) {
+    uint16_t raw;
+
+    wait_for_rdy_low();
+
+    if (!iqs9150_i2c_read_reg16(0x1014, &raw))
+        return false;
+    *x = (int16_t)raw;
+
+    // wait_for_rdy_low();
+
+    if (!iqs9150_i2c_read_reg16(0x1016, &raw))
+        return false;
+    *y = (int16_t)raw;
+
+    return true;
+}
+
 void azoteq_iqs9150_init(void) {
-    uint16_t product;
-    uint16_t config;
+    uint16_t product = 0;
+    uint16_t config  = 0;
 
     azoteq_iqs9150_init_status = I2C_STATUS_ERROR;
 
-    uprintf("\n=== IQS9150 INIT BEGIN ===\n");
+    uprintf("\n====================================\n");
+    uprintf("=== IQS9150 INIT BEGIN ===\n");
+    uprintf("====================================\n");
 
-    /* STEP 0: I2C lines idle */
+    /* STEP 0: Ensure I2C bus idle */
+    uprintf("[STEP 0] Initialising bitbanged I2C lines\n");
     iqs9150_i2c_init();
+    uprintf("[STEP 0] SDA=%ld SCL=%ld\n",
+            readPin(I2C1_SDA_PIN),
+            readPin(I2C1_SCL_PIN));
 
-    /* STEP 1: Wait for comms window */
+    /* STEP 1: Wait for communication window */
+    uprintf("[STEP 1] Waiting for RDY LOW (comms window)\n");
     wait_for_rdy_low();
+    uprintf("[STEP 1] RDY LOW detected\n");
 
     /* STEP 2: Read product ID */
+    uprintf("[STEP 2] Reading PRODUCT ID @ 0x1000\n");
     if (!iqs9150_i2c_read_reg16(0x1000, &product)) {
-        uprintf("IQS9150: product read failed\n");
+        uprintf("[ERROR] PRODUCT ID read failed\n");
         return;
     }
 
-    uprintf("IQS9150: product = 0x%04X\n", product);
+    uprintf("[STEP 2] PRODUCT ID = 0x%04X\n", product);
 
-    if (product != 0x076A && product != 0x09BC) {
-        uprintf("IQS9150: unknown product\n");
+    if (product == 0x076A) {
+        uprintf("[STEP 2] Detected IQS9150\n");
+    } else if (product == 0x09BC) {
+        uprintf("[STEP 2] Detected IQS9151\n");
+    } else {
+        uprintf("[ERROR] Unknown product ID\n");
         return;
     }
 
-    /* STEP 3: Clear SHOW_RESET (mandatory) */
+    /* STEP 3: Clear SHOW_RESET (mandatory after reset) */
+    uprintf("[STEP 3] Clearing SHOW_RESET via CONTROL (0x11BC)\n");
     wait_for_rdy_low();
 
-    /* CONTROL = ACK_RESET (0x80) */
+    uprintf("[STEP 3] Writing CONTROL = 0x0080 (ACK_RESET)\n");
     if (!iqs9150_i2c_write_reg16(0x11BC, 0x0080)) {
-        uprintf("IQS9150: failed to clear SHOW_RESET\n");
+        uprintf("[ERROR] Failed to clear SHOW_RESET\n");
         return;
     }
+    uprintf("[STEP 3] SHOW_RESET cleared\n");
 
-    /* STEP 4: Enable forced comms + streaming mode */
+    /* STEP 4: Enable forced comms, disable event mode */
+    uprintf("[STEP 4] Reading CONFIG register (0x11BE)\n");
     wait_for_rdy_low();
 
     if (!iqs9150_i2c_read_reg16(0x11BE, &config)) {
-        uprintf("IQS9150: failed to read CONFIG\n");
+        uprintf("[ERROR] Failed to read CONFIG\n");
         return;
     }
 
-    config |= (1 << 4);   /* FORCED_COMMS */
+    uprintf("[STEP 4] CONFIG before = 0x%04X\n", config);
+
+    config |=  (1 << 4);  /* FORCED_COMMS */
     config &= ~(1 << 8);  /* EVENT_MODE = streaming */
 
+    uprintf("[STEP 4] CONFIG after  = 0x%04X\n", config);
+    uprintf("[STEP 4]   FORCED_COMMS = %d\n", !!(config & (1 << 4)));
+    uprintf("[STEP 4]   EVENT_MODE   = %d (0 = streaming)\n", !!(config & (1 << 8)));
+
     if (!iqs9150_i2c_write_reg16(0x11BE, config)) {
-        uprintf("IQS9150: failed to write CONFIG\n");
+        uprintf("[ERROR] Failed to write CONFIG\n");
         return;
     }
 
-    /* STEP 5: Disable low power modes */
+    uprintf("[STEP 4] CONFIG written successfully\n");
+
+    /* STEP 5: Disable low-power timeouts */
+    uprintf("[STEP 5] Disabling LP timeouts via TIMEOUT_COMMS (0x11B8)\n");
     wait_for_rdy_low();
 
     if (!iqs9150_i2c_write_reg16(0x11B8, 0x00FF)) {
-        uprintf("IQS9150: failed to set TIMEOUT_COMMS\n");
+        uprintf("[ERROR] Failed to write TIMEOUT_COMMS\n");
         return;
     }
 
+    uprintf("[STEP 5] TIMEOUT_COMMS set to 0x00FF\n");
+
     /* STEP 6: Set resolution */
+    uprintf("[STEP 6] Setting resolution\n");
     wait_for_rdy_low();
+    uprintf("[STEP 6] Writing X_RES = 2048\n");
+    iqs9150_i2c_write_reg16(0x11E6, 2048);
 
-    iqs9150_i2c_write_reg16(0x11E6, 2048); // X_RES
-    iqs9150_i2c_write_reg16(0x11E8, 2048); // Y_RES
+    wait_for_rdy_low();
+    uprintf("[STEP 6] Writing Y_RES = 2048\n");
+    iqs9150_i2c_write_reg16(0x11E8, 2048);
 
-    /* STEP 7: End session */
+    uprintf("[STEP 6] Resolution configured\n");
+
+    /* STEP 7: End I2C session */
+    uprintf("[STEP 7] Ending I2C session (0xEEEE)\n");
     wait_for_rdy_low();
 
     iqs9150_i2c_write_reg16(0xEEEE, 0x0000);
+    uprintf("[STEP 7] Session ended\n");
 
     azoteq_iqs9150_init_status = I2C_STATUS_SUCCESS;
+
+    uprintf("====================================\n");
     uprintf("=== IQS9150 INIT OK ===\n");
+    uprintf("====================================\n");
 }
 
-
 report_mouse_t azoteq_iqs9150_get_report(report_mouse_t mouse_report) {
-    report_mouse_t temp_report = {0};
-    // azoteq_iqs9150_init();
+    report_mouse_t temp_report = mouse_report;
+
+    int16_t x = 0, y = 0;
+
+    if (iqs9150_read_rel_xy(&x, &y)) {
+        /* Clamp to HID range */
+        if (x > 127)  x = 127;
+        if (x < -127) x = -127;
+        if (y > 127)  y = 127;
+        if (y < -127) y = -127;
+
+        temp_report.x = (int8_t)x;
+        temp_report.y = (int8_t)y;
+
+        // /* OPTIONAL: throttled debug */
+        // static uint32_t last_print;
+        // if (timer_elapsed32(last_print) > 200) {
+        //     uprintf("REL_X=%d REL_Y=%d RDY=%ld\n",
+        //             x, y, readPin(IQS9150_RDY_PIN));
+        //     last_print = timer_read32();
+        // }
+    }
+
     return temp_report;
 }
