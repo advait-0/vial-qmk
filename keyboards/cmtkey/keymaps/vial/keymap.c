@@ -10,25 +10,22 @@
 #define SPACE_DOT_TERM 200
 static uint16_t space_timer = 0;
 static bool space_pending = false;
-static bool fn_oneshot_active = false;
 
 /* ───── Caps logic ───── */
 #define CAPS_TERM 200
 static uint16_t caps_timer = 0;
 static bool caps_pending = false;
 
-/* ───── Fn logic ───── */
-#define FN_TERM 200
-
-static uint16_t fn_timer = 0;
-static bool fn_pending = false;
-static bool fn_latched = false;
+/* ───── Fn sticky logic ───── */
+static bool fn_used = false;
+static bool fn_oneshot_active = false;
 
 /* Layers */
 #define L_BASE 0
-#define L_FN1  1
-#define L_FN2  2
+#define L_FN1  1   // sticky
+#define L_FN2  2   // hold (momentary)
 
+/* Custom keycodes */
 enum custom_keycodes {
     CAPS_SFT = SAFE_RANGE,
     FN_KEY,
@@ -57,16 +54,11 @@ void matrix_scan_user(void) {
     if (caps_pending && timer_elapsed(caps_timer) > CAPS_TERM) {
         caps_pending = false;
     }
-
-    /* reset fn tap window */
-    if (fn_pending && timer_elapsed(fn_timer) > FN_TERM) {
-        fn_pending = false;
-    }
 }
 
 bool process_record_user(uint16_t keycode, keyrecord_t *record) {
 
-    /* Clear sticky Fn after ANY key press */
+    /* Cancel sticky Fn after ANY key press */
     if (fn_oneshot_active &&
         record->event.pressed &&
         keycode != FN_KEY) {
@@ -96,48 +88,31 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
         return false;
     }
 
-    /* ───── FN: tap / double tap / hold ───── */
+    /* ───── FN: tap = sticky L_FN1, hold = L_FN2 ───── */
     if (keycode == FN_KEY) {
         if (record->event.pressed) {
-
-            /* double tap → latch layer 1 */
-            if (fn_pending && timer_elapsed(fn_timer) < FN_TERM) {
-                if (fn_latched) {
-                    layer_off(L_FN1);
-                    fn_latched = false;
-                } else {
-                    layer_on(L_FN1);
-                    fn_latched = true;
-                }
-                fn_pending = false;
-                return false;
-            }
-
-            /* first press → start hold + tap window */
-            fn_pending = true;
-            fn_timer = timer_read();
-
-            /* HOLD → layer 2 */
-            layer_on(L_FN2);
+            fn_used = false;
+            layer_on(L_FN2);          // IMMEDIATE (Shift-like)
             return false;
-
         } else {
-            /* release */
-
             layer_off(L_FN2);
 
-            /* single tap → sticky layer 1 */
-            if (fn_pending && !fn_latched) {
-            set_oneshot_layer(L_FN1, ONESHOT_START);
-            fn_oneshot_active = true;
-            fn_pending = false;
-
+            if (!fn_used) {
+                set_oneshot_layer(L_FN1, ONESHOT_START);
+                fn_oneshot_active = true;
             }
             return false;
         }
     }
 
-    /* ───── Space logic ───── */
+    /* mark Fn as used if any key is pressed while holding it */
+    if (layer_state_is(L_FN2) &&
+        record->event.pressed &&
+        keycode != FN_KEY) {
+        fn_used = true;
+    }
+
+    /* ───── Space ". " logic ───── */
     if (keycode == KC_SPC) {
         if (record->event.pressed) {
             if (space_pending && timer_elapsed(space_timer) < SPACE_DOT_TERM) {
@@ -174,7 +149,7 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
         FN_KEY, KC_LCTL, KC_LALT, KC_SPC, KC_NO, KC_NO, KC_DOT, KC_LEFT, KC_DOWN, KC_RGHT, KC_LGUI
     ),
 
-    /* FN1 — sticky / latched */
+    /* FN1 — sticky */
     [L_FN1] = LAYOUT(
         KC_1, KC_2, KC_3, KC_4, KC_5, KC_6, KC_7, KC_8, KC_9, KC_0, KC_ESC,
         KC_AT, KC_HASH, KC_DLR, KC_UNDS, KC_AMPR, KC_BSLS, KC_PLUS, KC_LPRN, KC_RPRN, KC_DEL, KC_MS_BTN1,
@@ -182,10 +157,10 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
         _______, KC_LCTL, KC_LALT, KC_SPC, KC_NO, KC_NO, KC_DOT, LSFT(KC_TAB), KC_DOWN, KC_TAB, KC_LGUI
     ),
 
-    /* FN2 — hold-only layer */
+    /* FN2 — hold-only */
     [L_FN2] = LAYOUT(
-        KC_TILD, KC_F1, KC_F2, KC_F3, KC_F4, KC_F5, KC_F6, KC_F7, KC_F8, KC_F9, KC_F10,
-        _______, _______, _______, _______, _______, _______, _______, _______, _______, _______, _______,
+        KC_F1, KC_F2, KC_F3, KC_F4, KC_F5, KC_F6, KC_F7, KC_F8, KC_F9, KC_F10, _______,
+        KC_TILD, KC_QUOT, KC_PERC, KC_CIRC, KC_PIPE, KC_MINS, KC_EQL, KC_LCBR, KC_RCBR, _______, _______,
         _______, _______, _______, _______, _______, _______, _______, _______, _______, _______, _______,
         _______, _______, _______, _______, _______, _______, _______, _______, _______, _______, _______
     ),
