@@ -33,6 +33,8 @@ enum custom_keycodes {
 
 void keyboard_post_init_user(void) {
     ws2812_init();
+    setPinOutput(LED_FN_LOCK_PIN);
+    writePinLow(LED_FN_LOCK_PIN); 
     debug_enable = true;
     debug_matrix = true;
     debug_keyboard = true;
@@ -65,6 +67,7 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
 
         clear_oneshot_layer_state(ONESHOT_PRESSED);
         fn_oneshot_active = false;
+        writePinLow(LED_FN_LOCK_PIN); 
     }
 
     /* ───── CAPS: hold = shift, double tap = caps lock ───── */
@@ -93,6 +96,7 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
         if (record->event.pressed) {
             fn_used = false;
             layer_on(L_FN2);          // IMMEDIATE (Shift-like)
+            writePinHigh(LED_FN_LOCK_PIN); 
             return false;
         } else {
             layer_off(L_FN2);
@@ -100,6 +104,10 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
             if (!fn_used) {
                 set_oneshot_layer(L_FN1, ONESHOT_START);
                 fn_oneshot_active = true;
+                writePinHigh(LED_FN_LOCK_PIN);
+            }
+            else {
+                writePinLow(LED_FN_LOCK_PIN);  // used → LED OFF
             }
             return false;
         }
@@ -134,6 +142,13 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
         tap_code(KC_SPC);
         space_pending = false;
     }
+
+    if (!layer_state_is(L_FN1) &&
+    !layer_state_is(L_FN2) &&
+    !fn_oneshot_active) {
+    writePinLow(LED_FN_LOCK_PIN);
+}
+
 
     return true;
 }

@@ -1,6 +1,8 @@
 #pragma once
 
 #define LED_CAPS_LOCK_PIN A8
+#define LED_FN_LOCK_PIN B10
+
 
 #define MATRIX_ROWS 4
 #define MATRIX_COLS 11
